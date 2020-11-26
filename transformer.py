@@ -1,4 +1,4 @@
-import torch, copy, math
+import torch, copy, math, time
 import torch.nn.functional as F 
 from torch.autograd import Variable
 import torch.nn as nn 
@@ -19,7 +19,7 @@ class EncoderDecoder(nn.Module):
     def encode(self, src, src_mask):
         return self.encoder(self.source_emb(src), src_mask)
 
-    def decoder(self, encoded, src_mask, tar, tar_mask):
+    def decode(self, encoded, src_mask, tar, tar_mask):
         return self.decoder(encoded, self.target_emb(tar), src_mask, tar_mask)
 
 
@@ -38,7 +38,7 @@ class Encoder(nn.Module):
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
         self.layers = clones(layer, N)
-        self.norm = LayerNorm(Layer.size)
+        self.norm = LayerNorm(layer.size)
 
     def forward(self, x, mask):
         for layer in self.layers:
@@ -54,8 +54,8 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         mean = x.mean(axis=-1, keepdims=True)
-        std = x.std(axis-1, keepdims=True)
-        return self.a2 * (x - mean) / (std + self.eps) + self.b2
+        std = x.std(axis=-1, keepdims=True)
+        return self.a2 * (x - mean) / (std + self.eps) + self.b1
 
 
 class SublayerConnection(nn.Module):
@@ -73,6 +73,7 @@ class EncoderLayer(nn.Module):
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
 
     def forward(self, x, mask):
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
@@ -114,6 +115,7 @@ def attention(query, key, value, mask=None, dropout=None):
     d = query.size(-1)
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d)
     if mask is not None:
+        print('score size', scores.shape, 'mask shape', mask.shape)
         scores = scores.masked_fill(mask==0, -1e9)
     p_attn = F.softmax(scores, dim=-1)
     if dropout is not None:
@@ -132,10 +134,11 @@ class MultiHeadAttention(nn.Module):
         self.attn = None
         self.dropout = dropout
 
-    def forward(self, query, key, value, mask):
-        nbatches = x.size(0)
+    def forward(self, query, key, value, mask=None):
+        nbatches = query.size(0)
+        if mask is not None: mask = mask.unsqueeze(1)
 
-        query, key, value = [l(x).view(nbatches, -1, nheads, dk).transpose(1, 2)
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.dk).transpose(1, 2)
         for l, x in zip(self.linears, (query, key, value))]
         x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
 
@@ -158,10 +161,10 @@ class Embedding(nn.Module):
     def __init__(self, dmodel, vocab):
         super(Embedding, self).__init__()
         self.l = nn.Embedding(vocab, dmodel)
-        self.dmodel = dmodel
+        self.d_model = dmodel
 
     def forward(self, x):
-        return self.l(x) * math.sqrt(self.dmodel)
+        return self.l(x) * math.sqrt(self.d_model)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, dmodel, dropout, maxlen=5000):
@@ -199,7 +202,7 @@ def make_model(
         Encoder(EncoderLayer(dmodel, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(dmodel, c(attn), c(attn), c(ff), dropout), N),
         nn.Sequential(Embedding(dmodel, source_vocab), c(pos)),
-        nn.Sequential(Embedding(dmodel, target_emb), c(pos)),
+        nn.Sequential(Embedding(dmodel, target_vocab), c(pos)),
         Generator(dmodel, target_vocab)
     )
 
@@ -223,7 +226,7 @@ class Batch:
     def make_std_mask(tgt, pad):
         tgt_mask = (tgt != pad).unsqueeze(-2)
         tgt_mask = tgt_mask & Variable(subsequent_mask(
-            tgt.size(-1).type_as(tgt_mask.data)))
+            tgt.size(-1)).type_as(tgt_mask.data))
         return tgt_mask
 
 
@@ -312,5 +315,47 @@ class LabelSmoothing(nn.Module):
         return self.criterion(x, Variable(true_dist, requires_grad=False))
 
 
+def data_gen(V, batch, nbatches):
+    for i in range(nbatches):
+        data = torch.from_numpy(np.random.randint(1, V, size=(batch, 10)))
+        data[:, 0] = 1
+        src = Variable(data, requires_grad=False)
+        trg = Variable(data, requires_grad=False)
+
+        yield Batch(src, trg, 0)
 
 
+class SimpleLossCompute:
+    def __init__(self, generator, criterion, opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.opt = opt
+    
+    def __call__(self, x, y, norm):
+        x = self.generator(x)
+        loss = self.criterion(
+            x.contiguous().view(-1, x.size(-1)),
+            y.contiguous().view(-1)) / norm
+        
+        loss.backward()
+
+        if self.opt is not None:
+            self.opt.step()
+            self.opt.optimizer.zero_grad()
+
+        return loss.data[0] * norm
+
+
+V = 11
+criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
+model = make_model(V, V, N=2)
+model_opt = NoamOpt(
+    model.source_emb[0].d_model, 1, 400,
+    torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9
+))
+
+for epoch in range(10):
+    model.train()
+    run_epoch(data_gen(V, 20, 20), model, SimpleLossCompute(model.generator, criterion, model_opt))
+    model.eval()
+    print(run_epoch(data_gen(V, 30, 5), model, SimpleLossCompute(model.generator, criterion, None)))    
